@@ -1,0 +1,115 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..e6acdbc 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -30,6 +30,9 @@ static bool
+ sweet_sample_wanted(const char *name)
+ {
+ 	size_t n = strlen(name);
++	if (strcmp(sweet_sample_names, "*") == 0) {
++		return true;
++	}
+ 	for (const char *t = sweet_sample_names; *t;) {
+ 		const char *end = strchr(t, ',');
+ 		size_t tl = end ? (size_t)(end - t) : strlen(t);
+@@ -70,11 +73,11 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
++	(void)tsleep(&chan, PZERO, "sweetsmp", 45 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", 60 * hz);
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..da96877 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -823,6 +823,7 @@ exception_triage(
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
+ #include <arm/thread.h>
++#include <kern/thread_kernel_state.h>
+ 
+ /*
+  * SWEET crash report on the console. The phone has no way to get crash
+@@ -996,6 +997,13 @@ sweet_crash_strings(const char *name)
+  */
+ void sweet_sample_task(const char *name, int pid, task_t task);
+ 
++static uint64_t
++sweet_unslide(uint64_t v)
++{
++	vm_offset_t u = VM_KERNEL_UNSLIDE(v);
++	return u ? (uint64_t)u : v;
++}
++
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+ {
+@@ -1009,21 +1017,56 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		slide = sr->sr_slide;
+ 		vm_shared_region_deallocate(sr);
+ 	}
+-	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
++	printf("SMP %s[%d] slide 0x%llx mh 0x%llx threads %d active %d halting %d\n", name, pid, slide,
++	    task->mach_header_vm_address, task->thread_count, task->active, task->halting);
+ 
+-	task_lock(task);
++	/* o1s: a stuck task may hold its own lock: never block the sampler on it */
++	if (!task_lock_try(task)) {
++		printf("SMP %s task lock busy\n", name);
++		return;
++	}
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+ 		char line[400];
+ 		int n;
+ 		uint64_t fp;
+ 
++		/*
++		 * o1s: every thread, also one without a 64-bit user state: what it
++		 * is blocked on and its kernel backtrace (unslid addresses for
++		 * kernel.development.sweet; raw if not in the kernel image).
++		 */
++		n = snprintf(line, sizeof(line), "SMP %s t%d st 0x%x hint %d pri %d kbt", name, tn,
++		    thread->state, (int)thread->block_hint, thread->sched_pri);
++		if (thread->kernel_stack == 0) {
++			n += snprintf(line + n, sizeof(line) - n, " cont 0x%llx",
++			    sweet_unslide((uint64_t)thread->continuation));
++		} else if (thread != current_thread()) {
++			struct arm_kernel_saved_state *ks =
++			    &((thread_kernel_state_t)thread->machine.kstackptr)->machine.ss;
++			uint64_t lo = thread->kernel_stack, hi = lo + kernel_stack_size;
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", sweet_unslide(ks->lr));
++			fp = ks->fp;
++			for (int i = 0; i < 14 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0 &&
++			    n < (int)sizeof(line) - 24; i++) {
++				const uint64_t *frame = (const uint64_t *)fp;
++				n += snprintf(line + n, sizeof(line) - n, " 0x%llx", sweet_unslide(frame[1]));
++				if (frame[0] <= fp) {
++					break;
++				}
++				fp = frame[0];
++			}
++		}
++		printf("%s\n", line);
++
+ 		if (ss == NULL || !is_saved_state64(ss)) {
++			tn++;
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+-		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx x16 %lld bt", name, tn++,
++		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss),
++		    (long long)get_saved_state_reg(ss, 16));
+ 		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
