@@ -27,18 +27,10 @@ index b40eccd..e6acdbc 100644
  }
  
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index a20a764..da96877 100644
+index a20a764..8f673bc 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -823,6 +823,7 @@ exception_triage(
- #if defined(ARM64_BOARD_CONFIG_SWEET)
- #include <vm/vm_shared_region.h>
- #include <arm/thread.h>
-+#include <kern/thread_kernel_state.h>
- 
- /*
-  * SWEET crash report on the console. The phone has no way to get crash
-@@ -996,6 +997,13 @@ sweet_crash_strings(const char *name)
+@@ -996,6 +996,13 @@ sweet_crash_strings(const char *name)
   */
  void sweet_sample_task(const char *name, int pid, task_t task);
  
@@ -52,7 +44,7 @@ index a20a764..da96877 100644
  void
  sweet_sample_task(const char *name, int pid, task_t task)
  {
-@@ -1009,21 +1017,56 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1009,21 +1016,56 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		slide = sr->sr_slide;
  		vm_shared_region_deallocate(sr);
  	}
