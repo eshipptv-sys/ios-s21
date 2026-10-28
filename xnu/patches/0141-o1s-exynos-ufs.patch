@@ -1,0 +1,168 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 143db60..50077ef 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -72,7 +72,17 @@ extern void sweet_usb_probe(void);
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+-#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
++/*
++ * o1s (Exynos UFS): the host takes at most 2^HCI_TXPRDT_ENTRY_SIZE bytes per
++ * PRDT entry (Linux and S-Boot: 4 KiB), so the PRDT has room for 4 KiB entries.
++ */
++#define PRDT_MIN_CHUNK  4096u
++#define PRDT_MAX        (BOUNCE_SIZE / PRDT_MIN_CHUNK)
++/* Exynos vendor HCI registers (ufs-vs-regs.h): second reg range, at +0x1100 */
++#define VS_BASE                 0x1100
++#define VS_TXPRDT_ENTRY_SIZE    0x00            /* [4:0] log2 bytes per entry */
++#define VS_RXPRDT_ENTRY_SIZE    0x04
++#define VS_UTRL_NEXUS_TYPE      0x40            /* bit per slot: 1 = SCSI command */
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+@@ -97,6 +107,7 @@ struct ucd {
+ #define DMA_UCD         0x1000                  /* 128 byte aligned */
+ #define DMA_BOUNCE      0x4000
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++_Static_assert(DMA_UCD + sizeof(struct ucd) <= DMA_BOUNCE, "UCD overlaps the bounce buffer");
+ 
+ static struct {
+ 	vm_offset_t regs;
+@@ -112,6 +123,8 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	bool exynos;                            /* o1s: Exynos host quirks */
++	uint32_t prdt_chunk;                    /* bytes per PRDT entry */
+ } su;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -171,16 +184,19 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	/* Exynos (UFSHCD_QUIRK_PRDT_BYTE_GRAN): UPIU/PRDT offsets and lengths in bytes */
++	utrd->resp = su.exynos ? (512u << 16 | 512u) : ((512u / 4) << 16 | (512u / 4));
++	uint32_t nprdt = 0;
+ 	if (len) {
+-		uint32_t n = 0;
+-		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+-			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
++		for (uint32_t done = 0; done < len; done += su.prdt_chunk, nprdt++) {
++			uint32_t chunk = MIN(su.prdt_chunk, len - done);
++			ucd->prdt[nprdt].addr_lo = (uint32_t)(bounce_pa + done);
++			ucd->prdt[nprdt].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			ucd->prdt[nprdt].dbc = chunk - 1;
+ 		}
+-		utrd->prdt = (1024u / 4) << 16 | n;
++		utrd->prdt = su.exynos ?
++		    (1024u << 16 | nprdt * (uint32_t)sizeof(ucd->prdt[0])) :
++		    ((1024u / 4) << 16 | nprdt);
+ 	}
+ 
+ 	if (su.cache) {
+@@ -189,7 +205,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 		if (len) {
+ 			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
++			    nprdt * sizeof(ucd->prdt[0]));
+ 		}
+ 	} else {
+ 		dma_sync(DMA_UTRL, sizeof(*utrd));
+@@ -202,6 +218,10 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 			dma_sync(DMA_BOUNCE, len);
+ 		}
+ 	}
++	if (su.exynos) {
++		/* slot 0 carries a SCSI command (ufs-exynos.c sets the bit per request) */
++		ufs_wr(VS_BASE + VS_UTRL_NEXUS_TYPE, ufs_rd(VS_BASE + VS_UTRL_NEXUS_TYPE) | 1u);
++	}
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+@@ -219,7 +239,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
++			/* Exynos (UFSHCI_QUIRK_BROKEN_REQ_LIST_CLR): writing 1 clears the slot */
++			ufs_wr(REG_UTRLCLR, su.exynos ? 1u : ~1u);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
+@@ -761,6 +782,29 @@ sweet_ufs_init(void)
+ 	su.wait = (wait == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	su.prdt_chunk = PRDT_CHUNK;
++	char const *compat = NULL;
++	unsigned int clen = 0;
++	if (SecureDTGetProperty(node, "compatible", (void const **)&compat, &clen) == kSuccess) {
++		for (unsigned int i = 0; i < clen; i += strlen(compat + i) + 1) {
++			if (strncmp(compat + i, "samsung,exynos", 14) == 0) {
++				su.exynos = true;
++			}
++		}
++	}
++	if (su.exynos) {
++		if (reg[1] < VS_BASE + 0x100) {
++			printf("SWEET UFS: Exynos host needs /sweet-ufs reg size >= 0x%x\n", VS_BASE + 0x100);
++			return ENXIO;
++		}
++		/* what S-Boot set up: 2^[4:0] bytes per PRDT entry, for tx and rx */
++		uint32_t tx = ufs_rd(VS_BASE + VS_TXPRDT_ENTRY_SIZE) & 0x1f;
++		uint32_t rx = ufs_rd(VS_BASE + VS_RXPRDT_ENTRY_SIZE) & 0x1f;
++		uint32_t lg = MIN(tx, rx);
++		su.prdt_chunk = (lg >= 12 && lg <= 18) ? (1u << lg) : PRDT_MIN_CHUNK;
++		printf("SWEET UFS: Exynos host: PRDT entries of %u bytes (tx %u rx %u), byte offsets\n",
++		    su.prdt_chunk, tx, rx);
++	}
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -776,6 +820,23 @@ sweet_ufs_init(void)
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++	if (!error && su.exynos) {
++		/*
++		 * o1s: S-Boot leaves the UFS device in Sleep/PowerDown, so LU 0
++		 * answers NOT READY 04/02 (initializing command required). Wake it
++		 * like Linux (ufshcd_set_dev_pwr_mode): START STOP UNIT, POWER
++		 * CONDITION = ACTIVE, START = 0, to the UFS Device W-LUN 0xd0.
++		 * Verified on the phone with shim probe #4 (28.10.2026).
++		 */
++		static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++		su.lun = 0xd0;
++		for (int i = 0; i < 3 && (error = ufs_scsi(ssu, sizeof(ssu), 0, false)); i++) {
++		}
++		su.lun = 0;
++		if (error) {
++			printf("SWEET UFS: START STOP UNIT (active) to the device W-LUN failed\n");
++		}
++	}
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+@@ -821,8 +882,13 @@ sweet_ufs_init(void)
+ 	 */
+ 	int hw = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+-	sweet_touch_init();
+-	sweet_keys_init();
++	if (su.exynos) {
++		/* their drivers poke Qualcomm QUP/TLMM/SPMI registers */
++		printf("SWEET UFS: touch/keys skipped (o1s)\n");
++	} else {
++		sweet_touch_init();
++		sweet_keys_init();
++	}
+ 	if (hw == 1) {
+ 		sweet_usb_probe();
+ 	} else {

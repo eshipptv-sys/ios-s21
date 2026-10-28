@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6f29fba..7b0cb62 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -305,9 +305,19 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+-	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+-	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	/*
++	 * o1s (disp0 "no-mdp"): no Qualcomm MDP/DSI/INTF registers. The copy
++	 * path draws into the S-Boot frame (boot_args.Video), which DECON keeps
++	 * scanning out by itself (the shim unmasked its TE trigger).
++	 */
++	bool noMdp = provider->getProperty("no-mdp") != NULL;
++	if (noMdp) {
++		IOLog("SWEET FB: no-mdp: copy path into the boot frame at %#llx\n",
++		    (unsigned long long)fPhys);
++	}
++	fVig0 = noMdp ? NULL : (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
++	fCtl0 = noMdp ? NULL : (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	fDsi = noMdp ? NULL : (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -350,7 +360,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	OSSafeReleaseNULL(accel);
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+-	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++	fIntf1 = noMdp ? NULL : (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
