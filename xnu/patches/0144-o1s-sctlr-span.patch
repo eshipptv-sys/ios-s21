@@ -1,0 +1,29 @@
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index e01c124..1ff5faa 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -651,11 +651,23 @@
+ #define SCTLR_JOP_KEYS_DEFAULT  0
+ #endif
+ 
++/*
++ * o1s: a kernel without PAN support never clears PSTATE.PAN, so taking an
++ * exception must leave it unchanged (SPAN=1). With SPAN=0 an ARMv8.1+ core
++ * (Cortex-A55) sets PAN on entry and every copyin/copyout faults forever.
++ * The bit is RES1 on ARMv8.0.
++ */
++#if __ARM_PAN_AVAILABLE__
++#define SCTLR_SPAN_DEFAULT      0
++#else
++#define SCTLR_SPAN_DEFAULT      SCTLR_PAN_UNCHANGED
++#endif
++
+ #define SCTLR_EL1_DEFAULT \
+ 	(SCTLR_RESERVED | SCTLR_UCI_ENABLED | SCTLR_nTWE_WFE_ENABLED | SCTLR_DZE_ENABLED | \
+ 	 SCTLR_I_ENABLED | SCTLR_SED_DISABLED | SCTLR_CP15BEN_ENABLED |                    \
+ 	 SCTLR_SA0_ENABLED | SCTLR_SA_ENABLED | SCTLR_C_ENABLED | SCTLR_M_ENABLED |        \
+-	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT |                                        \
++	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT | SCTLR_SPAN_DEFAULT |                   \
+ 	 SCTLR_ROP_KEYS_DEFAULT | SCTLR_JOP_KEYS_DEFAULT)
+ 
+ /*
