@@ -1,0 +1,34 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..4e4edb7 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -289,6 +289,14 @@ LEXT(bootstrap_instructions)
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+ 	msr		DAIFSet, #0xf
++	/* o1s diag: reached the PSCI entry - red bar at FB row ~2360 */
++	MOV64	x9, 0xFA9B9F80
++	MOV64	x10, 0xFFFF0000
++	mov		x11, #0x4380
++1:
++	str		w10, [x9], #4
++	subs	x11, x11, #1
++	b.ne	1b
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+@@ -325,6 +333,14 @@ Lsweet_secondary_bad_el:
+ 	b		.
+ Lsweet_secondary_el1:
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
++	/* o1s diag: passed EL2->EL1 - green bar at FB row ~2376 */
++	MOV64	x9, 0xFA9CA9C0
++	MOV64	x10, 0xFF00FF00
++	mov		x11, #0x4380
++1:
++	str		w10, [x9], #4
++	subs	x11, x11, #1
++	b.ne	1b
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+ #endif /* SWEET */
